@@ -1,0 +1,9 @@
+build/
+*.o
+*.ll
+*.out
+*.tab.cpp
+*.tab.h
+*.yy.cpp
+compile_commands.json
+.cache/

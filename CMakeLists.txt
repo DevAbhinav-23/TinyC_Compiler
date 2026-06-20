@@ -39,5 +39,4 @@ add_executable(tinyc
     ${FLEX_TinyCLexer_OUTPUTS}
 )
 
-llvm_map_components_to_libnames(llvm_libs core support irreader analysis executionengine native)
 target_link_libraries(tinyc PRIVATE LLVM)

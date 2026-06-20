@@ -79,11 +79,9 @@ int main(int argc, char** argv) {
     fprintf(stderr, "%s", irStr.c_str());
 
     // Initialize targets
-    llvm::InitializeAllTargetInfos();
-    llvm::InitializeAllTargets();
-    llvm::InitializeAllTargetMCs();
-    llvm::InitializeAllAsmParsers();
-    llvm::InitializeAllAsmPrinters();
+    llvm::InitializeNativeTarget();
+    llvm::InitializeNativeAsmParser();
+    llvm::InitializeNativeAsmPrinter();
 
     llvm::Triple targetTriple(llvm::sys::getDefaultTargetTriple());
     codegen.TheModule->setTargetTriple(targetTriple);

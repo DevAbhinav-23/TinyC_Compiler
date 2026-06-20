@@ -13,8 +13,6 @@ ID          [a-zA-Z_][a-zA-Z0-9_]*
 %%
 
 "int"           { return INT_KW; }
-"float"         { return FLOAT_KW; }
-"void"          { return VOID_KW; }
 "return"        { return RETURN_KW; }
 "if"            { return IF_KW; }
 "else"          { return ELSE_KW; }

@@ -12,6 +12,19 @@ using namespace llvm;
 
 CodeGen::CodeGen() : TheModule(std::make_unique<Module>("tinyc", Context)), Builder(Context) {}
 
+// ==================== Scope Management ====================
+
+void CodeGen::pushScope() {
+    NamedValuesStack.push_back(NamedValues);
+}
+
+void CodeGen::popScope() {
+    if (!NamedValuesStack.empty()) {
+        NamedValues = NamedValuesStack.back();
+        NamedValuesStack.pop_back();
+    }
+}
+
 void CodeGen::putVariable(const std::string& name, Value* val) {
     NamedValues[name] = val;
 }
@@ -29,13 +42,24 @@ Function* CodeGen::getFunction(const std::string& name) {
     return TheModule->getFunction(name);
 }
 
-Value* CodeGen::generate(Program& program) {
+// ==================== Program Codegen ====================
+
+void CodeGen::generate(Program& program) {
     // Declare printf
     std::vector<Type*> printfArgs({PointerType::getUnqual(Context)});
     FunctionType* printfType = FunctionType::get(Type::getInt32Ty(Context), printfArgs, true);
     Function::Create(printfType, Function::ExternalLinkage, "printf", TheModule.get());
 
-    Value* lastVal = nullptr;
+    // Declare fflush
+    std::vector<Type*> fflushArgs({PointerType::getUnqual(Context)});
+    FunctionType* fflushType = FunctionType::get(Type::getInt32Ty(Context), fflushArgs, false);
+    Function::Create(fflushType, Function::ExternalLinkage, "fflush", TheModule.get());
+
+    // Declare abort (noreturn)
+    FunctionType* abortType = FunctionType::get(Type::getVoidTy(Context), false);
+    Function* abortFn = Function::Create(abortType, Function::ExternalLinkage, "abort", TheModule.get());
+    abortFn->addFnAttr(Attribute::NoReturn);
+
     for (auto& func : program.functions) {
         std::vector<Type*> paramTypes;
         for (auto& p : func->params)
@@ -51,7 +75,8 @@ Value* CodeGen::generate(Program& program) {
         BasicBlock* entryBB = BasicBlock::Create(Context, "entry", function);
         Builder.SetInsertPoint(entryBB);
 
-        auto oldNamedValues = NamedValues;
+        // Save outer scope and create fresh scope for this function
+        pushScope();
         NamedValues.clear();
         idx = 0;
         for (auto& p : func->params) {
@@ -63,16 +88,18 @@ Value* CodeGen::generate(Program& program) {
 
         Functions[func->name] = function;
 
-        for (auto& stmt : func->body)
-            lastVal = stmt->codegen(*this);
+        for (auto& stmt : func->body) {
+            // Stop generating if current block already has a terminator (e.g., after return)
+            if (Builder.GetInsertBlock()->getTerminator()) break;
+            stmt->codegen(*this);
+        }
 
         if (!Builder.GetInsertBlock()->getTerminator())
             Builder.CreateRet(ConstantInt::get(Type::getInt32Ty(Context), 0));
 
-        NamedValues = oldNamedValues;
+        popScope();
         verifyFunction(*function);
     }
-    return lastVal;
 }
 
 // ==================== Expr codegen ====================
@@ -88,6 +115,55 @@ Value* VariableExpr::codegen(CodeGen& cg) {
 }
 
 Value* BinaryExpr::codegen(CodeGen& cg) {
+    // Short-circuit evaluation for logical AND and OR
+    if (op == 'a' || op == 'o') {
+        Function* fn = cg.Builder.GetInsertBlock()->getParent();
+
+        // Evaluate LHS in the current block
+        Value* L = lhs->codegen(cg);
+        if (!L) return nullptr;
+        Value* LBool = cg.Builder.CreateICmpNE(
+            L, ConstantInt::get(Type::getInt32Ty(cg.Context), 0), "lbool");
+
+        // The block where LHS was evaluated (current block before branch)
+        BasicBlock* lhsBB = cg.Builder.GetInsertBlock();
+
+        BasicBlock* rhsBB = BasicBlock::Create(cg.Context, "rhs", fn);
+        BasicBlock* mergeBB = BasicBlock::Create(cg.Context, "merge", fn);
+
+        if (op == 'a') {
+            // AND: if L is false, skip RHS (result = false)
+            cg.Builder.CreateCondBr(LBool, rhsBB, mergeBB);
+        } else {
+            // OR: if L is true, skip RHS (result = true)
+            cg.Builder.CreateCondBr(LBool, mergeBB, rhsBB);
+        }
+
+        // Evaluate RHS
+        cg.Builder.SetInsertPoint(rhsBB);
+        Value* R = rhs->codegen(cg);
+        if (!R) return nullptr;
+        Value* RBool = cg.Builder.CreateICmpNE(
+            R, ConstantInt::get(Type::getInt32Ty(cg.Context), 0), "rbool");
+        cg.Builder.CreateBr(mergeBB);
+
+        // Merge: PHI node to select the right boolean
+        cg.Builder.SetInsertPoint(mergeBB);
+        PHINode* phi = cg.Builder.CreatePHI(Type::getInt1Ty(cg.Context), 2, "logic");
+
+        if (op == 'a') {
+            // AND: false from LHS block (short-circuit), true from RHS block
+            phi->addIncoming(ConstantInt::getFalse(cg.Context), lhsBB);
+            phi->addIncoming(RBool, rhsBB);
+        } else {
+            // OR: true from LHS block (short-circuit), false from RHS block
+            phi->addIncoming(ConstantInt::getTrue(cg.Context), lhsBB);
+            phi->addIncoming(RBool, rhsBB);
+        }
+
+        return cg.Builder.CreateZExt(phi, Type::getInt32Ty(cg.Context), "booltmp");
+    }
+
     Value* L = lhs->codegen(cg);
     Value* R = rhs->codegen(cg);
     if (!L || !R) return nullptr;
@@ -96,8 +172,48 @@ Value* BinaryExpr::codegen(CodeGen& cg) {
         case '+': return cg.Builder.CreateAdd(L, R, "addtmp");
         case '-': return cg.Builder.CreateSub(L, R, "subtmp");
         case '*': return cg.Builder.CreateMul(L, R, "multmp");
-        case '/': return cg.Builder.CreateSDiv(L, R, "divtmp");
-        case '%': return cg.Builder.CreateSRem(L, R, "modtmp");
+        case '/': {
+            // Division by zero check
+            Value* isZero = cg.Builder.CreateICmpEQ(
+                R, ConstantInt::get(Type::getInt32Ty(cg.Context), 0), "divbyzero");
+            Function* fn = cg.Builder.GetInsertBlock()->getParent();
+            BasicBlock* divBB = BasicBlock::Create(cg.Context, "div", fn);
+            BasicBlock* errorBB = BasicBlock::Create(cg.Context, "diverror", fn);
+            cg.Builder.CreateCondBr(isZero, errorBB, divBB);
+
+            cg.Builder.SetInsertPoint(errorBB);
+            Value* fmtStr = cg.Builder.CreateGlobalString("Error: Division by zero\n", "diverr");
+            cg.Builder.CreateCall(cg.TheModule->getFunction("printf"), {fmtStr});
+            // Flush stdout before abort so error message is visible
+            Value* nullPtr = ConstantPointerNull::get(PointerType::getUnqual(cg.Context));
+            cg.Builder.CreateCall(cg.TheModule->getFunction("fflush"), {nullPtr});
+            cg.Builder.CreateCall(cg.TheModule->getFunction("abort"), {});
+            cg.Builder.CreateUnreachable();
+
+            cg.Builder.SetInsertPoint(divBB);
+            return cg.Builder.CreateSDiv(L, R, "divtmp");
+        }
+        case '%': {
+            // Modulo by zero check
+            Value* isZero = cg.Builder.CreateICmpEQ(
+                R, ConstantInt::get(Type::getInt32Ty(cg.Context), 0), "modbyzero");
+            Function* fn = cg.Builder.GetInsertBlock()->getParent();
+            BasicBlock* modBB = BasicBlock::Create(cg.Context, "mod", fn);
+            BasicBlock* errorBB = BasicBlock::Create(cg.Context, "moderror", fn);
+            cg.Builder.CreateCondBr(isZero, errorBB, modBB);
+
+            cg.Builder.SetInsertPoint(errorBB);
+            Value* fmtStr = cg.Builder.CreateGlobalString("Error: Modulo by zero\n", "moderr");
+            cg.Builder.CreateCall(cg.TheModule->getFunction("printf"), {fmtStr});
+            // Flush stdout before abort so error message is visible
+            Value* nullPtr = ConstantPointerNull::get(PointerType::getUnqual(cg.Context));
+            cg.Builder.CreateCall(cg.TheModule->getFunction("fflush"), {nullPtr});
+            cg.Builder.CreateCall(cg.TheModule->getFunction("abort"), {});
+            cg.Builder.CreateUnreachable();
+
+            cg.Builder.SetInsertPoint(modBB);
+            return cg.Builder.CreateSRem(L, R, "modtmp");
+        }
         case '<': {
             Value* cmp = cg.Builder.CreateICmpSLT(L, R, "cmplt");
             return cg.Builder.CreateZExt(cmp, Type::getInt32Ty(cg.Context), "booltmp");
@@ -121,18 +237,6 @@ Value* BinaryExpr::codegen(CodeGen& cg) {
         case 'g': {
             Value* cmp = cg.Builder.CreateICmpSGE(L, R, "cmpge");
             return cg.Builder.CreateZExt(cmp, Type::getInt32Ty(cg.Context), "booltmp");
-        }
-        case 'a': {
-            L = cg.Builder.CreateICmpNE(L, ConstantInt::get(Type::getInt32Ty(cg.Context), 0), "tobool1");
-            R = cg.Builder.CreateICmpNE(R, ConstantInt::get(Type::getInt32Ty(cg.Context), 0), "tobool2");
-            Value* andVal = cg.Builder.CreateAnd(L, R, "andtmp");
-            return cg.Builder.CreateZExt(andVal, Type::getInt32Ty(cg.Context), "booltmp");
-        }
-        case 'o': {
-            L = cg.Builder.CreateICmpNE(L, ConstantInt::get(Type::getInt32Ty(cg.Context), 0), "tobool1");
-            R = cg.Builder.CreateICmpNE(R, ConstantInt::get(Type::getInt32Ty(cg.Context), 0), "tobool2");
-            Value* orVal = cg.Builder.CreateOr(L, R, "ortmp");
-            return cg.Builder.CreateZExt(orVal, Type::getInt32Ty(cg.Context), "booltmp");
         }
         default:
             fprintf(stderr, "Error: Unknown binary operator '%c'\n", op);
@@ -221,15 +325,25 @@ Value* IfStmt::codegen(CodeGen& cg) {
 
     cg.Builder.CreateCondBr(condBool, thenBB, elseBB);
 
+    // Then branch with scope
     cg.Builder.SetInsertPoint(thenBB);
-    for (auto& s : thenBody)
+    cg.pushScope();
+    for (auto& s : thenBody) {
+        if (cg.Builder.GetInsertBlock()->getTerminator()) break;
         s->codegen(cg);
+    }
+    cg.popScope();
     if (!cg.Builder.GetInsertBlock()->getTerminator())
         cg.Builder.CreateBr(mergeBB);
 
+    // Else branch with scope
     cg.Builder.SetInsertPoint(elseBB);
-    for (auto& s : elseBody)
+    cg.pushScope();
+    for (auto& s : elseBody) {
+        if (cg.Builder.GetInsertBlock()->getTerminator()) break;
         s->codegen(cg);
+    }
+    cg.popScope();
     if (!cg.Builder.GetInsertBlock()->getTerminator())
         cg.Builder.CreateBr(mergeBB);
 
@@ -254,8 +368,12 @@ Value* WhileStmt::codegen(CodeGen& cg) {
     cg.Builder.CreateCondBr(condBool, loopBody, loopEnd);
 
     cg.Builder.SetInsertPoint(loopBody);
-    for (auto& s : body)
+    cg.pushScope();
+    for (auto& s : body) {
+        if (cg.Builder.GetInsertBlock()->getTerminator()) break;
         s->codegen(cg);
+    }
+    cg.popScope();
     if (!cg.Builder.GetInsertBlock()->getTerminator())
         cg.Builder.CreateBr(loopCond);
 
@@ -287,8 +405,12 @@ Value* ForStmt::codegen(CodeGen& cg) {
     }
 
     cg.Builder.SetInsertPoint(loopBody);
-    for (auto& s : body)
+    cg.pushScope();
+    for (auto& s : body) {
+        if (cg.Builder.GetInsertBlock()->getTerminator()) break;
         s->codegen(cg);
+    }
+    cg.popScope();
 
     if (incr)
         incr->codegen(cg);
@@ -316,6 +438,6 @@ Value* PrintStmt::codegen(CodeGen& cg) {
     Value* val = value->codegen(cg);
     if (!val) return nullptr;
 
-    Value* fmtStr = cg.Builder.CreateGlobalStringPtr("%d\n", "fmt");
+    Value* fmtStr = cg.Builder.CreateGlobalString("%d\n", "fmt");
     return cg.Builder.CreateCall(printfFn, {fmtStr, val}, "printtmp");
 }

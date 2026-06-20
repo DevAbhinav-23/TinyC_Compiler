@@ -6,6 +6,7 @@
 #include "llvm/IR/IRBuilder.h"
 #include "llvm/IR/Verifier.h"
 #include <map>
+#include <vector>
 #include <string>
 #include <memory>
 
@@ -15,12 +16,15 @@ public:
     std::unique_ptr<llvm::Module> TheModule;
     llvm::IRBuilder<> Builder;
     std::map<std::string, llvm::Value*> NamedValues;
+    std::vector<std::map<std::string, llvm::Value*>> NamedValuesStack;
     std::map<std::string, llvm::Function*> Functions;
 
     CodeGen();
 
-    llvm::Value* generate(Program& program);
+    void generate(Program& program);
     llvm::Function* getFunction(const std::string& name);
     void putVariable(const std::string& name, llvm::Value* val);
     llvm::Value* getVariable(const std::string& name);
+    void pushScope();
+    void popScope();
 };
